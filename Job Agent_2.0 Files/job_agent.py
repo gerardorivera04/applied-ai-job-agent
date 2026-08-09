@@ -31,10 +31,12 @@ SETUP
 
 OUTPUT
 ------
-Prints a ranked list to the console and writes results to
-`job_matches.csv` in the same directory (new listings only get
-re-scored on future runs -- already-seen jobs are cached in
-`seen_jobs.json` so you don't pay for re-scoring or get duplicates).
+Prints a ranked list to the console, writes results to `job_matches.csv`,
+and (if configured) emails you a formatted digest of new matches.
+New listings only get re-scored on future runs -- already-seen jobs are
+cached in `seen_jobs.json` so you don't pay for re-scoring or get
+duplicates. See README.md for scheduling this with cron and setting up
+email delivery.
 """
 
 import os
@@ -42,16 +44,10 @@ import re
 import json
 import csv
 import sys
-import textwrap
 import time
 from datetime import datetime
 
 import requests
-
-# Clear any inherited proxy settings so requests use direct network access.
-for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
-    os.environ.pop(key, None)
-os.environ.setdefault("NO_PROXY", "*")
 
 # ============================================================
 # CONFIG -- edit this section
@@ -59,13 +55,13 @@ os.environ.setdefault("NO_PROXY", "*")
 
 CONFIG = {
     # --- Resume ---
-    "resume_path": "resume.pdf/Resume copy.pdf",  # .pdf, .docx, or .txt
+    "resume_path": "resume.pdf",  # .pdf, .docx, or .txt
 
     # --- Adzuna search ---
     "adzuna": {
         "enabled": True,
         "country": "us",             # e.g. "us", "gb", "au"
-        "what": "software engineer, backend engineer", # search keywords
+        "what": "software engineer", # search keywords
         "where": "remote",           # location or "remote"
         "results_per_page": 20,
         "max_pages": 2,              # 2 pages = up to 40 listings
@@ -76,25 +72,19 @@ CONFIG = {
     # Find a company's slug from their careers URL, e.g.
     # boards.greenhouse.io/stripe -> "stripe"
     "greenhouse_companies": [
-        "stripe",
-        "airbnb",
-        "notion",
-        "datadog",
+        # "stripe",
+        # "airbnb",
     ],
 
     # --- Lever target companies ---
     # Find a company's slug from their careers URL, e.g.
     # jobs.lever.co/netflix -> "netflix"
     "lever_companies": [
-        "github",
-        "netflix",
-        "anthropic",
-        "openai",
+        # "netflix",
     ],
 
     # --- Matching ---
     "min_score_to_show": 60,   # only show matches scoring >= this (0-100)
-    "show_top_n_only": 5,      # show only the top N matches in the summary view
     "claude_model": "claude-sonnet-4-6",
 
     # --- Output ---
@@ -113,7 +103,9 @@ CONFIG = {
     },
 }
 
-# Resolve relative paths from the script directory so cron works reliably.
+# Resolve all file paths relative to this script's directory, not the
+# caller's working directory -- important for cron, which runs with an
+# arbitrary/empty working directory.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _resolve(path: str) -> str:
@@ -128,21 +120,6 @@ def load_resume_text(path: str) -> str:
         print(f"ERROR: resume file not found at '{path}'. "
               f"Set CONFIG['resume_path'] to a valid .pdf, .docx, or .txt file.")
         sys.exit(1)
-
-    if os.path.isdir(path):
-        candidates = []
-        for entry in sorted(os.listdir(path)):
-            full_path = os.path.join(path, entry)
-            if os.path.isfile(full_path):
-                ext = os.path.splitext(entry)[1].lower()
-                if ext in {".txt", ".pdf", ".docx"}:
-                    candidates.append(full_path)
-        if not candidates:
-            print(f"ERROR: resume directory '{path}' does not contain a supported .pdf, .docx, or .txt file.")
-            sys.exit(1)
-        if len(candidates) > 1:
-            print(f"Using resume file '{candidates[0]}' from directory '{path}'.")
-        path = candidates[0]
 
     ext = os.path.splitext(path)[1].lower()
 
@@ -177,16 +154,6 @@ def load_resume_text(path: str) -> str:
 
 
 # ============================================================
-# NETWORK HELPERS
-# ============================================================
-
-def build_request_session() -> requests.Session:
-    session = requests.Session()
-    session.trust_env = False
-    return session
-
-
-# ============================================================
 # SOURCE: ADZUNA
 # ============================================================
 
@@ -203,7 +170,6 @@ def fetch_adzuna_jobs(cfg: dict) -> list:
 
     jobs = []
     country = a["country"]
-    session = build_request_session()
 
     for page in range(1, a["max_pages"] + 1):
         url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
@@ -219,7 +185,7 @@ def fetch_adzuna_jobs(cfg: dict) -> list:
             params["salary_min"] = a["salary_min"]
 
         try:
-            resp = session.get(url, params=params, timeout=20)
+            resp = requests.get(url, params=params, timeout=20)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -252,11 +218,10 @@ def fetch_adzuna_jobs(cfg: dict) -> list:
 
 def fetch_greenhouse_jobs(companies: list) -> list:
     jobs = []
-    session = build_request_session()
     for slug in companies:
         url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
         try:
-            resp = session.get(url, params={"content": "true"}, timeout=20)
+            resp = requests.get(url, params={"content": "true"}, timeout=20)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -287,11 +252,10 @@ def fetch_greenhouse_jobs(companies: list) -> list:
 
 def fetch_lever_jobs(companies: list) -> list:
     jobs = []
-    session = build_request_session()
     for slug in companies:
         url = f"https://api.lever.co/v0/postings/{slug}"
         try:
-            resp = session.get(url, params={"mode": "json"}, timeout=20)
+            resp = requests.get(url, params={"mode": "json"}, timeout=20)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -403,94 +367,21 @@ def write_csv(path: str, rows: list):
             writer.writerow({k: r.get(k, "") for k in fieldnames})
 
 
-def format_posted_date(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    except ValueError:
-        return value
-
-
-def print_results(rows: list, min_score: int, top_n: int | None = None):
+def print_results(rows: list, min_score: int):
     shown = [r for r in rows if r["score"] >= min_score]
     shown.sort(key=lambda r: r["score"], reverse=True)
 
-    if top_n is not None:
-        shown = shown[:top_n]
-
     print("\n" + "=" * 70)
-    print(f"TOP MATCHES (score >= {min_score})")
-    print(f"{len(shown)} result(s) shown")
-    if top_n is not None and len(rows) > top_n:
-        print(f"Showing the top {top_n} of {len(rows)} matches")
+    print(f"MATCHES (score >= {min_score}): {len(shown)}")
     print("=" * 70)
-
-    for idx, r in enumerate(shown, 1):
-        posted = format_posted_date(r.get("posted", ""))
-        location = r.get("location") or "Location not listed"
-        source = r.get("source", "unknown").title()
-        details = f"{r.get('company', 'Unknown')} • {location} • {source}"
-        if posted:
-            details += f" • Posted {posted}"
-
-        print(f"\n{idx}. [{r['score']}/100] {r['title']}")
-        print(f"   {details}")
-        print(f"   Why it matches: {textwrap.shorten(r.get('reason', 'No reason provided'), width=110, placeholder='...')}")
-        print(f"   Link: {r.get('url', 'No URL available')}")
-        if idx < len(shown):
-            print("   " + "-" * 60)
+    for r in shown:
+        print(f"\n[{r['score']}] {r['title']} @ {r['company']} ({r['source']})")
+        print(f"    {r['location']}")
+        print(f"    {r['reason']}")
+        print(f"    {r['url']}")
 
     if not shown:
         print("No new matches above threshold this run.")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    resume_path = _resolve(CONFIG["resume_path"])
-    seen_jobs_path = _resolve(CONFIG["seen_jobs_path"])
-    csv_path = _resolve(CONFIG["csv_path"])
-
-    print("Loading resume...")
-    resume_text = load_resume_text(resume_path)
-    print(f"Resume loaded ({len(resume_text)} characters).\n")
-
-    all_jobs = []
-    all_jobs += fetch_adzuna_jobs(CONFIG)
-    all_jobs += fetch_greenhouse_jobs(CONFIG["greenhouse_companies"])
-    all_jobs += fetch_lever_jobs(CONFIG["lever_companies"])
-
-    if not all_jobs:
-        print("\nNo jobs fetched from any source. Check your CONFIG and API keys.")
-        return
-
-    seen = load_seen_jobs(seen_jobs_path)
-    new_jobs = [j for j in all_jobs if j["id"] not in seen]
-    print(f"\n{len(all_jobs)} total listings fetched, {len(new_jobs)} are new.")
-
-    if not new_jobs:
-        print("No new listings since last run.")
-        send_email(CONFIG, [])
-        return
-
-    print(f"\nScoring {len(new_jobs)} new listings against your resume...")
-    results = []
-    for i, job in enumerate(new_jobs, 1):
-        print(f"  [{i}/{len(new_jobs)}] {job['title']} @ {job['company']}")
-        score_data = score_job_against_resume(job, resume_text, CONFIG["claude_model"])
-        job.update(score_data)
-        results.append(job)
-        seen[job["id"]] = {"scored_at": datetime.now().isoformat(), "score": score_data["score"]}
-        time.sleep(0.3)  # gentle rate limiting
-
-    save_seen_jobs(seen_jobs_path, seen)
-    write_csv(csv_path, results)
-    print_results(results, CONFIG["min_score_to_show"], CONFIG.get("show_top_n_only"))
-    send_email(CONFIG, results)
-    print(f"\nAll scored results appended to: {csv_path}")
 
 
 def build_email_html(rows: list, min_score: int) -> str:
@@ -559,6 +450,56 @@ def send_email(cfg: dict, rows: list):
         print(f"Email: sent to {recipient}.")
     except Exception as ex:
         print(f"Email: failed to send -- {ex}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    resume_path = _resolve(CONFIG["resume_path"])
+    seen_jobs_path = _resolve(CONFIG["seen_jobs_path"])
+    csv_path = _resolve(CONFIG["csv_path"])
+
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] Starting job agent run.")
+    print("Loading resume...")
+    resume_text = load_resume_text(resume_path)
+    print(f"Resume loaded ({len(resume_text)} characters).\n")
+
+    all_jobs = []
+    all_jobs += fetch_adzuna_jobs(CONFIG)
+    all_jobs += fetch_greenhouse_jobs(CONFIG["greenhouse_companies"])
+    all_jobs += fetch_lever_jobs(CONFIG["lever_companies"])
+
+    if not all_jobs:
+        print("\nNo jobs fetched from any source. Check your CONFIG and API keys.")
+        return
+
+    seen = load_seen_jobs(seen_jobs_path)
+    new_jobs = [j for j in all_jobs if j["id"] not in seen]
+    print(f"\n{len(all_jobs)} total listings fetched, {len(new_jobs)} are new.")
+
+    if not new_jobs:
+        print("No new listings since last run.")
+        send_email(CONFIG, [])  # respects send_if_empty
+        return
+
+    print(f"\nScoring {len(new_jobs)} new listings against your resume...")
+    results = []
+    for i, job in enumerate(new_jobs, 1):
+        print(f"  [{i}/{len(new_jobs)}] {job['title']} @ {job['company']}")
+        score_data = score_job_against_resume(job, resume_text, CONFIG["claude_model"])
+        job.update(score_data)
+        results.append(job)
+        seen[job["id"]] = {"scored_at": datetime.now().isoformat(), "score": score_data["score"]}
+        time.sleep(0.3)  # gentle rate limiting
+
+    save_seen_jobs(seen_jobs_path, seen)
+    write_csv(csv_path, results)
+    print_results(results, CONFIG["min_score_to_show"])
+    send_email(CONFIG, results)
+    print(f"\nAll scored results appended to: {csv_path}")
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] Run complete.")
 
 
 if __name__ == "__main__":
